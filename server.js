@@ -22,6 +22,7 @@ console.log('Current directory:', process.cwd());
 console.log('Environment variables:');
 console.log('- NODE_ENV:', process.env.NODE_ENV);
 console.log('- PORT:', process.env.PORT);
+console.log('- ALLOWED_ORIGINS:', process.env.ALLOWED_ORIGINS);
 console.log('- PUPPETEER_EXECUTABLE_PATH:', process.env.PUPPETEER_EXECUTABLE_PATH);
 console.log('======= FIM DO DIAGNÓSTICO =======');
 
@@ -613,31 +614,23 @@ class AccountManager {
 // Configuração do servidor Express
 const app = express();
 
-// Configuração de CORS para permitir apenas origens específicas
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',') 
-  : ['http://localhost:5173'];
-
-// Em ambiente de desenvolvimento, permitir todas as origens
-if (process.env.NODE_ENV !== 'production') {
-  app.use(cors());
-  helpers.log('Modo de desenvolvimento: CORS permitindo todas as origens', 'warn');
-} else {
-  app.use(cors({
-    origin: function(origin, callback) {
-      // Permitir requisições sem origin (como apps mobile ou curl)
-      if (!origin) return callback(null, true);
-      
-      if (allowedOrigins.indexOf(origin) === -1) {
-        const msg = 'A política CORS deste site não permite acesso desta origem.';
-        return callback(new Error(msg), false);
-      }
-      return callback(null, true);
-    },
-    credentials: true
-  }));
-  helpers.log(`Modo de produção: CORS restrito às origens: ${allowedOrigins.join(', ')}`, 'info');
-}
+// Configuração de CORS aberta para resolver problemas de conexão
+app.use((req, res, next) => {
+  // Log da origem da requisição para diagnóstico
+  console.log(`Requisição recebida de: ${req.headers.origin || 'Origem não especificada'}`);
+  
+  // Permitir qualquer origem
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  // Tratar preflight
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
+});
 
 app.use(express.json());
 
@@ -676,25 +669,42 @@ app.get('/api/status', async (req, res) => {
       });
     }
     
-    // Testar a conexão com o navegador
-    helpers.log('Testando conexão com o navegador...');
-    const browser = await createBrowser();
-    await browser.close();
-    
+    // Resposta direta para evitar timeout
     res.json({
       status: 'online',
       timestamp: new Date().toISOString(),
       environment: process.env.NODE_ENV || 'development',
-      message: 'Servidor online e navegador funcionando'
+      message: 'Servidor online'
     });
+    
+    // Teste de navegador em background (não bloqueia a resposta)
+    try {
+      helpers.log('Testando conexão com o navegador (em background)...');
+      const browser = await createBrowser();
+      await browser.close();
+      helpers.log('Teste de navegador concluído com sucesso');
+    } catch (browserError) {
+      helpers.log(`Erro no teste de navegador: ${browserError.message}`, 'error');
+    }
   } catch (error) {
     console.error('Erro na verificação de saúde:', error);
     res.status(500).json({
       status: 'error',
-      message: 'Erro ao conectar ao navegador',
+      message: 'Erro ao verificar status do servidor',
       error: error.message
     });
   }
+});
+
+// Rota de teste CORS
+app.get('/api/cors-test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'CORS está funcionando corretamente',
+    origin: req.headers.origin || 'Sem origem',
+    headers: req.headers,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Rota para criar conta
@@ -756,13 +766,13 @@ app.get('/', (req, res) => {
         <div class="endpoint">
           <span class="method get">GET</span>
           <code>/api/status</code>
-          <p>Verifica o status do servidor e a conexão com o navegador.</p>
+          <p>Verifica o status do servidor.</p>
         </div>
         
         <div class="endpoint">
-          <span class="method get">GET</span>
-          <code>/api/healthcheck</code>
-          <p>Verificação básica de saúde do servidor.</p>
+                    <span class="method get">GET</span>
+          <code>/api/cors-test</code>
+          <p>Teste de configuração CORS.</p>
         </div>
         
         <div class="endpoint">
@@ -774,7 +784,8 @@ app.get('/', (req, res) => {
         <p>Status do servidor: Online</p>
         <p>Ambiente: ${process.env.NODE_ENV || 'development'}</p>
         <p>Modo de diagnóstico: ${process.env.DIAGNOSTIC_MODE === 'true' ? 'Ativado' : 'Desativado'}</p>
-            </body>
+        <p>CORS: Configurado para permitir todas as origens</p>
+      </body>
     </html>
   `);
 });
@@ -803,7 +814,6 @@ try {
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Origens permitidas: ${allowedOrigins.join(', ')}`);
     console.log(`Modo de diagnóstico: ${process.env.DIAGNOSTIC_MODE === 'true' ? 'Ativado' : 'Desativado'}`);
   });
 

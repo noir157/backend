@@ -1,11 +1,13 @@
 import express from 'express';
 import cors from 'cors';
-import puppeteer from 'puppeteer';
+import puppeteerCore from 'puppeteer-core';
+import chromium from 'chrome-aws-lambda';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
 
 // Configuração inicial
 dotenv.config();
@@ -65,6 +67,75 @@ const helpers = {
     }
 };
 
+// Função para criar instância do navegador
+async function createBrowser() {
+    const isProd = process.env.NODE_ENV === 'production';
+    helpers.log(`Criando navegador em ambiente ${isProd ? 'de produção' : 'de desenvolvimento'}`);
+
+    try {
+        // Verificar se estamos usando browserless.io
+        if (process.env.BROWSERLESS_TOKEN) {
+            helpers.log('Usando Browserless.io para navegador remoto');
+            return await puppeteerCore.connect({
+                browserWSEndpoint: `wss://chrome.browserless.io?token=${process.env.BROWSERLESS_TOKEN}`,
+                defaultViewport: { width: 1280, height: 800 }
+            });
+        }
+
+        // Em ambiente de produção (Railway)
+        if (isProd) {
+            helpers.log('Iniciando Chrome usando chrome-aws-lambda');
+            return puppeteerCore.launch({
+                args: [
+                    ...chromium.args,
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu'
+                ],
+                defaultViewport: chromium.defaultViewport,
+                executablePath: await chromium.executablePath,
+                headless: true,
+                ignoreHTTPSErrors: true
+            });
+        }
+
+        // Em ambiente de desenvolvimento
+        helpers.log('Iniciando Chrome local para desenvolvimento');
+        const executablePath = process.env.CHROME_PATH ||
+            (process.platform === 'win32'
+                ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+                : process.platform === 'darwin'
+                    ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+                    : '/usr/bin/google-chrome');
+
+        helpers.log(`Caminho do executável Chrome: ${executablePath}`);
+
+        return puppeteerCore.launch({
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu'
+            ],
+            executablePath,
+            headless: true,
+            ignoreHTTPSErrors: true
+        });
+    } catch (error) {
+        helpers.log(`Erro ao criar navegador: ${error.message}`, 'error');
+        throw error;
+    }
+}
+
 // Serviço de Email Temporário
 class TempEmailService {
     constructor() {
@@ -76,8 +147,8 @@ class TempEmailService {
     async createAccount() {
         try {
             helpers.log('Obtendo domínios disponíveis...');
-            const domainsResponse = await fetch(`${this.baseUrl}/domains`);
-            const domainsData = await domainsResponse.json();
+            const domainsResponse = await axios.get(`${this.baseUrl}/domains`);
+            const domainsData = domainsResponse.data;
             const domain = domainsData["hydra:member"][0].domain;
 
             const username = `user${Math.floor(Math.random() * 100000)}${Date.now().toString().slice(-4)}`;
@@ -85,25 +156,17 @@ class TempEmailService {
             const email = `${username}@${domain}`;
 
             helpers.log(`Criando conta com email: ${email}`);
-            await fetch(`${this.baseUrl}/accounts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    address: email,
-                    password: password
-                })
+            await axios.post(`${this.baseUrl}/accounts`, {
+                address: email,
+                password: password
             });
 
             helpers.log('Obtendo token de acesso...');
-            const tokenResponse = await fetch(`${this.baseUrl}/token`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    address: email,
-                    password: password
-                })
+            const tokenResponse = await axios.post(`${this.baseUrl}/token`, {
+                address: email,
+                password: password
             });
-            const tokenData = await tokenResponse.json();
+            const tokenData = tokenResponse.data;
 
             this.account = { email, password };
             this.token = tokenData.token;
@@ -127,10 +190,10 @@ class TempEmailService {
             helpers.log(`Tentativa ${attempt}/${maxAttempts} de verificar emails...`);
 
             try {
-                const response = await fetch(`${this.baseUrl}/messages`, {
+                const response = await axios.get(`${this.baseUrl}/messages`, {
                     headers: { 'Authorization': `Bearer ${this.token}` }
                 });
-                const data = await response.json();
+                const data = response.data;
                 const messages = data["hydra:member"];
 
                 if (messages && messages.length > 0) {
@@ -156,10 +219,10 @@ class TempEmailService {
 
         try {
             helpers.log(`Obtendo detalhes da mensagem ${messageId}...`);
-            const response = await fetch(`${this.baseUrl}/messages/${messageId}`, {
+            const response = await axios.get(`${this.baseUrl}/messages/${messageId}`, {
                 headers: { 'Authorization': `Bearer ${this.token}` }
             });
-            const messageData = await response.json();
+            const messageData = response.data;
 
             helpers.log('Estrutura da resposta do email:');
             helpers.log(`- Tem HTML: ${Boolean(messageData.html)}`);
@@ -295,18 +358,18 @@ class AccountManager {
     async fillRegistrationForm(page, credentials) {
         try {
             helpers.log('Preenchendo campo de email...');
-            await page.waitForSelector('input[name="email"]');
+            await page.waitForSelector('input[name="email"]', { timeout: 30000 });
             await helpers.randomDelay(300, 600);
             await page.type('input[name="email"]', credentials.email, { delay: 30 + Math.random() * 50 });
 
             helpers.log('Preenchendo campo de usuário...');
             await helpers.randomDelay(200, 500);
-            await page.waitForSelector('input[name="username"]');
+            await page.waitForSelector('input[name="username"]', { timeout: 30000 });
             await page.type('input[name="username"]', credentials.username, { delay: 30 + Math.random() * 50 });
 
             helpers.log('Preenchendo campo de senha...');
             await helpers.randomDelay(200, 500);
-            await page.waitForSelector('input[name="password"]');
+            await page.waitForSelector('input[name="password"]', { timeout: 30000 });
             await page.type('input[name="password"]', credentials.password, { delay: 30 + Math.random() * 50 });
 
             helpers.log('Preenchendo campo de confirmação de senha...');
@@ -419,19 +482,7 @@ class AccountManager {
             console.log(`- Password: ${accountCredentials.password}`);
 
             helpers.log('Iniciando navegador...');
-            browser = await puppeteer.launch({
-                headless: true,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--single-process',
-                    '--disable-gpu'
-                ]
-            });
+            browser = await createBrowser();
 
             const page = await browser.newPage();
             page.setDefaultNavigationTimeout(60000);
@@ -439,7 +490,10 @@ class AccountManager {
             await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36');
 
             helpers.log('Navegando para a página de registro...');
-            await page.goto('https://stackblitz.com/register?redirect_to=/oauth/authorize?client_id=bolt&response_type=code&redirect_uri=https%3A%2F%2Fbolt.new%2Foauth2&code_challenge_method=S256&code_challenge=ARGuTD1lpTZHCQWoHSbB5FkpFaQw2xXeUBWdIEW46uU&state=f0d2aaed-3c6d-4cf2-b0d7-1473411ffe4e&scope=public', { waitUntil: 'networkidle2' });
+            await page.goto('https://stackblitz.com/register?redirect_to=/oauth/authorize?client_id=bolt&response_type=code&redirect_uri=https%3A%2F%2Fbolt.new%2Foauth2&code_challenge_method=S256&code_challenge=ARGuTD1lpTZHCQWoHSbB5FkpFaQw2xXeUBWdIEW46uU&state=f0d2aaed-3c6d-4cf2-b0d7-1473411ffe4e&scope=public', {
+                waitUntil: 'networkidle2',
+                timeout: 60000
+            });
 
             helpers.log('Preenchendo formulário...');
             await this.fillRegistrationForm(page, accountCredentials);
@@ -471,7 +525,10 @@ class AccountManager {
             }
 
             helpers.log('Navegando para o link de confirmação...');
-            await page.goto(confirmationLink, { waitUntil: 'networkidle2' });
+            await page.goto(confirmationLink, {
+                waitUntil: 'networkidle2',
+                timeout: 60000
+            });
 
             helpers.log('Aguardando processamento da confirmação...');
             await helpers.delay(5000);
@@ -512,30 +569,70 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(',')
     : ['http://localhost:5173'];
 
-app.use(cors({
-    origin: function (origin, callback) {
-        // Permitir requisições sem origin (como apps mobile ou curl)
-        if (!origin) return callback(null, true);
+// Em ambiente de desenvolvimento, permitir todas as origens
+if (process.env.NODE_ENV !== 'production') {
+    app.use(cors());
+    helpers.log('Modo de desenvolvimento: CORS permitindo todas as origens', 'warn');
+} else {
+    app.use(cors({
+        origin: function (origin, callback) {
+            // Permitir requisições sem origin (como apps mobile ou curl)
+            if (!origin) return callback(null, true);
 
-        if (allowedOrigins.indexOf(origin) === -1) {
-            const msg = 'A política CORS deste site não permite acesso desta origem.';
-            return callback(new Error(msg), false);
-        }
-        return callback(null, true);
-    },
-    credentials: true
-}));
+            if (allowedOrigins.indexOf(origin) === -1) {
+                const msg = 'A política CORS deste site não permite acesso desta origem.';
+                return callback(new Error(msg), false);
+            }
+            return callback(null, true);
+        },
+        credentials: true
+    }));
+    helpers.log(`Modo de produção: CORS restrito às origens: ${allowedOrigins.join(', ')}`, 'info');
+}
 
 app.use(express.json());
 
+// Middleware para logging de requisições
+app.use((req, res, next) => {
+    helpers.log(`${req.method} ${req.path} - IP: ${req.ip}`, 'info');
+    next();
+});
+
+// Instância global do gerenciador de contas
 const accountManager = new AccountManager();
+
+// Rota para verificar status do servidor
+app.get('/api/status', async (req, res) => {
+    try {
+        // Testar a conexão com o navegador
+        const browser = await createBrowser();
+        await browser.close();
+
+        res.json({
+            status: 'online',
+            timestamp: new Date().toISOString(),
+            environment: process.env.NODE_ENV || 'development',
+            message: 'Servidor online e navegador funcionando'
+        });
+    } catch (error) {
+        console.error('Erro na verificação de saúde:', error);
+        res.status(500).json({
+            status: 'error',
+            message: 'Erro ao conectar ao navegador',
+            error: error.message
+        });
+    }
+});
 
 // Rota para criar conta
 app.post('/api/create-account', async (req, res) => {
     try {
+        helpers.log('Recebida solicitação para criar conta', 'info');
         const result = await accountManager.createAndConfirmAccount();
+        helpers.log(`Processo finalizado com ${result.success ? 'sucesso' : 'erro'}`, result.success ? 'success' : 'error');
         res.json(result);
     } catch (error) {
+        helpers.log(`Erro não tratado: ${error.message}`, 'error');
         res.status(500).json({
             success: false,
             error: error instanceof Error ? error.message : 'Unknown error'
@@ -543,17 +640,97 @@ app.post('/api/create-account', async (req, res) => {
     }
 });
 
-// Rota para verificar status do servidor
-app.get('/api/status', (req, res) => {
-    res.json({
-        status: 'online',
-        timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
+// Rota para a raiz do servidor
+app.get('/', (req, res) => {
+    res.send(`
+    <html>
+      <head>
+        <title>Bolt Account Creator API</title>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
+          h1 { color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+          .endpoint { background: #f4f4f4; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+          .method { display: inline-block; padding: 5px 10px; border-radius: 3px; color: white; margin-right: 10px; }
+          .get { background: #61affe; }
+          .post { background: #49cc90; }
+          code { background: #f8f8f8; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+        </style>
+      </head>
+      <body>
+        <h1>Bolt Account Creator API</h1>
+        <p>Esta API permite a criação automatizada de contas bolt.new.</p>
+        
+        <h2>Endpoints disponíveis:</h2>
+        
+        <div class="endpoint">
+          <span class="method get">GET</span>
+          <code>/api/status</code>
+          <p>Verifica o status do servidor e a conexão com o navegador.</p>
+        </div>
+        
+        <div class="endpoint">
+          <span class="method post">POST</span>
+          <code>/api/create-account</code>
+          <p>Cria uma nova conta bolt.new automaticamente.</p>
+        </div>
+        
+        <p>Status do servidor: Online</p>
+        <p>Ambiente: ${process.env.NODE_ENV || 'development'}</p>
+      </body>
+    </html>
+  `);
+});
+
+// Middleware para tratamento de rotas não encontradas
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint não encontrado'
+    });
+});
+
+// Middleware para tratamento de erros
+app.use((err, req, res, next) => {
+    console.error('Erro não tratado:', err);
+    res.status(500).json({
+        success: false,
+        error: 'Erro interno do servidor',
+        message: err.message
     });
 });
 
 // Inicie o servidor
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Origens permitidas: ${allowedOrigins.join(', ')}`);
+});
+
+// Tratamento para shutdown gracioso
+process.on('SIGTERM', () => {
+    console.log('SIGTERM recebido, encerrando servidor...');
+    server.close(() => {
+        console.log('Servidor encerrado');
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT recebido, encerrando servidor...');
+    server.close(() => {
+        console.log('Servidor encerrado');
+        process.exit(0);
+    });
+});
+
+// Tratamento de exceções não capturadas
+process.on('uncaughtException', (err) => {
+    console.error('Exceção não capturada:', err);
+    // Não encerrar o processo para manter o servidor rodando
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Rejeição não tratada em:', promise, 'razão:', reason);
+    // Não encerrar o processo para manter o servidor rodando
 });
